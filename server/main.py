@@ -1,6 +1,8 @@
 import os
 import urllib.parse
 import smtplib
+import time
+import logging
 from email.message import EmailMessage
 from typing import List
 
@@ -8,6 +10,18 @@ from dotenv import load_dotenv
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("anjaneya-wood-works")
 
 
 # =========================================================
@@ -27,7 +41,7 @@ load_dotenv(
 
 app = FastAPI(
     title="Anjaneya Wood Works API",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 
@@ -81,7 +95,10 @@ SMTP_PASSWORD = os.getenv(
 ).strip()
 
 
-# Remove placeholder values automatically
+# =========================================================
+# REMOVE PLACEHOLDER PASSWORDS
+# =========================================================
+
 PLACEHOLDER_PASSWORDS = {
     "PUT_GMAIL_APP_PASSWORD_HERE",
     "YOUR_GMAIL_APP_PASSWORD",
@@ -94,6 +111,26 @@ if SMTP_PASSWORD.upper() in {
     for value in PLACEHOLDER_PASSWORDS
 }:
     SMTP_PASSWORD = ""
+
+
+# =========================================================
+# LIMITS
+# =========================================================
+
+MAX_IMAGES = 6
+
+# Maximum size of one image
+MAX_IMAGE_SIZE = 10 * 1024 * 1024
+
+# Keep total attachments comfortably below Gmail's
+# message-size limit.
+MAX_TOTAL_IMAGE_SIZE = 20 * 1024 * 1024
+
+# SMTP connection timeout
+SMTP_TIMEOUT = 60
+
+# Number of attempts when SMTP temporarily fails
+SMTP_MAX_RETRIES = 3
 
 
 # =========================================================
@@ -150,7 +187,7 @@ async def root():
     return {
         "status": "online",
         "service": "Anjaneya Wood Works API",
-        "version": "1.2.0"
+        "version": "1.3.0"
     }
 
 
@@ -241,6 +278,190 @@ async def orders(
 
 
 # =========================================================
+# SMTP SEND FUNCTION
+# =========================================================
+
+def send_email_with_retry(
+    msg: EmailMessage
+) -> None:
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        SMTP_MAX_RETRIES + 1
+    ):
+
+        smtp = None
+
+        try:
+
+            logger.info(
+                "SMTP attempt %s/%s",
+                attempt,
+                SMTP_MAX_RETRIES
+            )
+
+            # -------------------------------------------------
+            # Gmail SSL - Port 465
+            # -------------------------------------------------
+
+            if SMTP_PORT == 465:
+
+                smtp = smtplib.SMTP_SSL(
+                    SMTP_HOST,
+                    SMTP_PORT,
+                    timeout=SMTP_TIMEOUT
+                )
+
+                smtp.ehlo()
+
+            # -------------------------------------------------
+            # STARTTLS - Port 587
+            # -------------------------------------------------
+
+            else:
+
+                smtp = smtplib.SMTP(
+                    SMTP_HOST,
+                    SMTP_PORT,
+                    timeout=SMTP_TIMEOUT
+                )
+
+                smtp.ehlo()
+
+                smtp.starttls()
+
+                smtp.ehlo()
+
+            # -------------------------------------------------
+            # LOGIN
+            # -------------------------------------------------
+
+            smtp.login(
+                SMTP_USERNAME,
+                SMTP_PASSWORD
+            )
+
+            # -------------------------------------------------
+            # SEND
+            # -------------------------------------------------
+
+            smtp.send_message(msg)
+
+            logger.info(
+                "Email sent successfully on attempt %s",
+                attempt
+            )
+
+            return
+
+        except smtplib.SMTPAuthenticationError as exc:
+
+            logger.error(
+                "Gmail authentication failed: %s",
+                exc
+            )
+
+            # Authentication won't be fixed by retrying.
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Gmail authentication failed. "
+                    "Check the SMTP_USERNAME and Gmail "
+                    "App Password in Render."
+                )
+            )
+
+        except (
+            smtplib.SMTPServerDisconnected,
+            smtplib.SMTPConnectError,
+            smtplib.SMTPException,
+            TimeoutError,
+            OSError
+        ) as exc:
+
+            last_error = exc
+
+            logger.warning(
+                "SMTP attempt %s failed: %s",
+                attempt,
+                exc
+            )
+
+            # Close broken connection
+            try:
+
+                if smtp:
+                    smtp.quit()
+
+            except Exception:
+
+                pass
+
+            # Retry if attempts remain
+            if attempt < SMTP_MAX_RETRIES:
+
+                wait_seconds = attempt * 2
+
+                logger.info(
+                    "Retrying SMTP in %s seconds...",
+                    wait_seconds
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+        except Exception as exc:
+
+            last_error = exc
+
+            logger.exception(
+                "Unexpected email error"
+            )
+
+            try:
+
+                if smtp:
+                    smtp.quit()
+
+            except Exception:
+
+                pass
+
+            break
+
+        finally:
+
+            try:
+
+                if smtp:
+                    smtp.quit()
+
+            except Exception:
+
+                pass
+
+    # ---------------------------------------------------------
+    # All retries failed
+    # ---------------------------------------------------------
+
+    logger.error(
+        "All SMTP attempts failed. Last error: %s",
+        last_error
+    )
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Email service is temporarily unavailable. "
+            "Please try again in a few seconds."
+        )
+    )
+
+
+# =========================================================
 # EMAIL ORDER WITH ACTUAL IMAGE ATTACHMENTS
 # =========================================================
 
@@ -264,48 +485,48 @@ async def email_order(
     ),
 ):
 
-    # -----------------------------------------------------
-    # Validate number of images
-    # -----------------------------------------------------
+    logger.info(
+        "New email order received: category=%s customer=%s images=%s",
+        category,
+        name,
+        len(images)
+    )
 
-    if len(images) > 6:
+    # =======================================================
+    # VALIDATE NUMBER OF IMAGES
+    # =======================================================
+
+    if len(images) > MAX_IMAGES:
 
         raise HTTPException(
             status_code=400,
             detail=(
-                "Maximum 6 reference images "
-                "are allowed."
+                f"Maximum {MAX_IMAGES} "
+                "reference images are allowed."
             )
         )
 
-
-    # -----------------------------------------------------
-    # Validate customer email
-    # -----------------------------------------------------
+    # =======================================================
+    # VALIDATE CUSTOMER EMAIL
+    # =======================================================
 
     if not email.strip():
 
         raise HTTPException(
             status_code=422,
-            detail=(
-                "Customer email is required."
-            )
+            detail="Customer email is required."
         )
 
-
-    # -----------------------------------------------------
-    # Validate SMTP configuration
-    # -----------------------------------------------------
+    # =======================================================
+    # VALIDATE SMTP CONFIGURATION
+    # =======================================================
 
     if not SMTP_USERNAME:
 
         raise HTTPException(
             status_code=503,
-            detail=(
-                "SMTP_USERNAME is not configured."
-            )
+            detail="SMTP_USERNAME is not configured."
         )
-
 
     if not SMTP_PASSWORD:
 
@@ -313,25 +534,20 @@ async def email_order(
             status_code=503,
             detail=(
                 "Email service is not configured. "
-                "Add SMTP_PASSWORD to your server .env "
-                "or Render environment variables."
+                "Add SMTP_PASSWORD to Render environment variables."
             )
         )
-
 
     if not OWNER_EMAIL:
 
         raise HTTPException(
             status_code=503,
-            detail=(
-                "OWNER_EMAIL is not configured."
-            )
+            detail="OWNER_EMAIL is not configured."
         )
 
-
-    # -----------------------------------------------------
-    # Create email
-    # -----------------------------------------------------
+    # =======================================================
+    # CREATE EMAIL
+    # =======================================================
 
     msg = EmailMessage()
 
@@ -380,28 +596,29 @@ async def email_order(
         "contact the customer."
     )
 
-
-    # -----------------------------------------------------
-    # Attach images
-    # -----------------------------------------------------
+    # =======================================================
+    # ATTACH IMAGES
+    # =======================================================
 
     attached_count = 0
+
+    total_image_size = 0
 
     for upload in images:
 
         if not upload:
             continue
 
-
         data = await upload.read()
-
 
         if not data:
             continue
 
+        # ---------------------------------------------------
+        # Individual image limit
+        # ---------------------------------------------------
 
-        # 10 MB maximum per image
-        if len(data) > 10 * 1024 * 1024:
+        if len(data) > MAX_IMAGE_SIZE:
 
             filename = (
                 upload.filename
@@ -411,23 +628,37 @@ async def email_order(
             raise HTTPException(
                 status_code=413,
                 detail=(
-                    f"{filename} is larger "
-                    "than 10 MB."
+                    f"{filename} is larger than "
+                    "10 MB. Please choose a smaller image."
                 )
             )
 
+        # ---------------------------------------------------
+        # Total attachment limit
+        # ---------------------------------------------------
+
+        total_image_size += len(data)
+
+        if total_image_size > MAX_TOTAL_IMAGE_SIZE:
+
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "The total size of reference images "
+                    "must be 20 MB or less. "
+                    "Please select fewer or smaller images."
+                )
+            )
 
         filename = (
             upload.filename
             or "reference-image.jpg"
         )
 
-
         content_type = (
             upload.content_type
             or "application/octet-stream"
         )
-
 
         if "/" in content_type:
 
@@ -443,7 +674,6 @@ async def email_order(
             maintype = "application"
             subtype = "octet-stream"
 
-
         msg.add_attachment(
             data,
             maintype=maintype,
@@ -451,93 +681,28 @@ async def email_order(
             filename=filename
         )
 
-
         attached_count += 1
 
+    logger.info(
+        "Prepared email with %s attachments, total size %.2f MB",
+        attached_count,
+        total_image_size / (1024 * 1024)
+    )
 
-    # -----------------------------------------------------
-    # Send email
-    # -----------------------------------------------------
+    # =======================================================
+    # SEND EMAIL
+    # =======================================================
 
-    try:
+    send_email_with_retry(msg)
 
-        if SMTP_PORT == 465:
+    # =======================================================
+    # SUCCESS
+    # =======================================================
 
-            with smtplib.SMTP_SSL(
-                SMTP_HOST,
-                SMTP_PORT,
-                timeout=25
-            ) as smtp:
-
-                smtp.login(
-                    SMTP_USERNAME,
-                    SMTP_PASSWORD
-                )
-
-                smtp.send_message(
-                    msg
-                )
-
-        else:
-
-            with smtplib.SMTP(
-                SMTP_HOST,
-                SMTP_PORT,
-                timeout=25
-            ) as smtp:
-
-                smtp.ehlo()
-
-                smtp.starttls()
-
-                smtp.ehlo()
-
-                smtp.login(
-                    SMTP_USERNAME,
-                    SMTP_PASSWORD
-                )
-
-                smtp.send_message(
-                    msg
-                )
-
-
-    except smtplib.SMTPAuthenticationError:
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Gmail authentication failed. "
-                "Use the Gmail App Password, "
-                "not your normal Gmail password."
-            )
-        )
-
-
-    except smtplib.SMTPException as exc:
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Email provider rejected "
-                f"the message: {exc}"
-            )
-        )
-
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Email sending failed: {exc}"
-            )
-        )
-
-
-    # -----------------------------------------------------
-    # Success
-    # -----------------------------------------------------
+    logger.info(
+        "Order email successfully delivered to %s",
+        OWNER_EMAIL
+    )
 
     return {
         "ok": True,
